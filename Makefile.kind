@@ -1,0 +1,33 @@
+##@ Local Kind Cluster
+
+.PHONY: kind-create
+kind-create: ## Create a local Kind cluster named 'kind'
+	@kind get clusters | grep -q '^kind$$' || kind create cluster --name kind
+
+.PHONY: kind-delete
+kind-delete: ## Delete the local Kind cluster named 'kind'
+	-kind delete cluster --name kind
+
+.PHONY: kind-load-image
+kind-load-image: docker-build ## Build and load the controller image into the Kind cluster
+	kind load docker-image $(IMG) --name kind
+
+.PHONY: kind-setup
+kind-setup: kind-create kind-load-image ## Setup Kind cluster, install CRDs, and load controller image
+
+.PHONY: kind-restart
+kind-restart: ## Restart the controller Deployment in Kind
+	kubectl rollout restart deployment -n aknsc-system aknsc-controller-manager
+
+.PHONY: kind-deploy
+kind-deploy: kind-setup ## Deploy controller to Kind cluster
+	$(MAKE) deploy
+	$(MAKE) kind-restart
+	kubectl wait pods --for=condition=Ready --timeout=300s --all --all-namespaces
+
+.PHONY: kind-clean
+kind-clean: kind-delete ## Clean up Kind cluster 
+
+.PHONY: kind-deploy-manifests
+kind-deploy-manifests:
+	kubectl apply -k config/samples/
