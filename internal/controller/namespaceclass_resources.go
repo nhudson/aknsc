@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,7 +99,7 @@ func (r *NamespaceClassReconciler) findManagedResourcesForGV(
 
 	for _, apiResource := range apiResources {
 		// Skip resources we can't work with
-		if !apiResource.Namespaced || !containsString(apiResource.Verbs, "list") {
+		if !apiResource.Namespaced || !slices.Contains(apiResource.Verbs, "list") {
 			continue
 		}
 
@@ -172,16 +173,6 @@ func (r *NamespaceClassReconciler) listManagedResourcesOfKind(
 	return resources
 }
 
-// containsString checks if a string slice contains a specific string
-func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
 // applyResourceToNamespace applies a resource defined in a NamespaceClass to a namespace.
 // It handles both creation of new resources and updates to existing ones.
 func (r *NamespaceClassReconciler) applyResourceToNamespace(
@@ -211,9 +202,7 @@ func (r *NamespaceClassReconciler) applyResourceToNamespace(
 		"name", resourceName,
 		"apiVersion", apiVersion)
 
-	if err := r.prepareResourceForNamespace(unstructuredObj, namespace, namespaceClass); err != nil {
-		return fmt.Errorf("failed to prepare resource %s/%s: %w", resourceKind, resourceName, err)
-	}
+	r.prepareResourceForNamespace(unstructuredObj, namespace, namespaceClass)
 
 	if err := r.applyUnstructuredResource(ctx, unstructuredObj); err != nil {
 		return fmt.Errorf("failed to apply resource %s/%s to namespace %s: %w",
@@ -233,7 +222,7 @@ func (r *NamespaceClassReconciler) prepareResourceForNamespace(
 	obj *unstructured.Unstructured,
 	namespace *corev1.Namespace,
 	namespaceClass *v1alpha1.NamespaceClass,
-) error {
+) {
 	// Set the namespace for the resource
 	obj.SetNamespace(namespace.Name)
 
@@ -244,8 +233,6 @@ func (r *NamespaceClassReconciler) prepareResourceForNamespace(
 	}
 	labels[NamespaceClassOwner] = namespaceClass.Name
 	obj.SetLabels(labels)
-
-	return nil
 }
 
 // applyUnstructuredResource creates or updates an unstructured resource.
