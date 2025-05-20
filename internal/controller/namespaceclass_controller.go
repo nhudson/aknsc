@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,22 +55,22 @@ type NamespaceClassReconciler struct {
 // +kubebuilder:rbac:groups=akuity.io,resources=namespaceclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=*,resources=*,verbs=get;list;watch;create;update;patch;delete
 
-// NamespaceClassLabel is the label key for associating a Namespace with a NamespaceClass.
-const NamespaceClassLabel = "namespaceclass.akuity.io/name"
+const (
+	// NamespaceClassLabel is the label key for associating a Namespace with a NamespaceClass.
+	NamespaceClassLabel = "namespaceclass.akuity.io/name"
 
-// NamespaceClassFinalizer is the finalizer key for NamespaceClass resources.
-const NamespaceClassFinalizer = "namespaceclass.akuity.io/finalizer"
+	// NamespaceClassFinalizer is the finalizer key for NamespaceClass resources.
+	NamespaceClassFinalizer = "namespaceclass.akuity.io/finalizer"
 
-// NamespaceClassOwner is the label key for associating a resource with a NamespaceClass.
-const NamespaceClassOwner = "namespaceclass.akuity.io/owner"
+	// NamespaceClassOwner is the label key for associating a resource with a NamespaceClass.
+	NamespaceClassOwner = "namespaceclass.akuity.io/owner"
 
-// LastAppliedClassAnnotation is the annotation key for tracking the original NamespaceClass on a Namespace.
-// This is only set once when a class is first applied, and never changes.
-const LastAppliedClassAnnotation = "namespaceclass.akuity.io/last-applied-class"
+	// LastAppliedClassAnnotation is the annotation key for tracking the last applied NamespaceClass on a Namespace.
+	LastAppliedClassAnnotation = "namespaceclass.akuity.io/last-applied-class"
 
-// CurrentClassAnnotation is the annotation key for tracking the currently applied NamespaceClass on a Namespace.
-// This is updated every time resources from a new class are applied.
-const CurrentClassAnnotation = "namespaceclass.akuity.io/current-class"
+	// CurrentClassAnnotation is the annotation key for tracking the currently applied NamespaceClass on a Namespace.
+	CurrentClassAnnotation = "namespaceclass.akuity.io/current-class"
+)
 
 func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	contextLogger := logf.FromContext(ctx)
@@ -115,6 +116,13 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			}
 		}
 
+		// Update status to track namespaces using this class
+		if err := r.updateNamespaceClassStatus(ctx, namespaceClass); err != nil {
+			contextLogger.Error(err, "Failed to update NamespaceClass status")
+			return ctrl.Result{}, err
+		}
+
+		contextLogger.Info("Successfully reconciled NamespaceClass")
 		return ctrl.Result{}, nil
 	} else if !apierrors.IsNotFound(err) {
 		contextLogger.Error(err, "Failed to get NamespaceClass", "name", req.NamespacedName.Name)
@@ -209,13 +217,19 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 		currentClass = currentNamespaceClass.Name
 	}
 
+	// Track previous class for status updates
+	previousClass := currentClass
+
 	// Detect class switch by comparing current class with target class
 	if currentClass != "" && currentClass != currentNamespaceClass.Name {
-		contextLogger.Info("Detected NamespaceClass switch - CLEANUP NEEDED",
+		contextLogger.Info("Detected NamespaceClass switch",
 			"namespace", latestNamespace.Name,
-			"currentClass", currentClass,
+			"previousClass", currentClass,
 			"targetClass", currentNamespaceClass.Name,
 			"originalClass", originalClass)
+
+		// Store the previous class for status update before cleaning up
+		previousClass = currentClass
 
 		// Clean up resources from the current class before switching
 		if err := r.cleanupPreviousNamespaceClassResources(ctx, latestNamespace, currentClass, currentNamespaceClass.Name); err != nil {
@@ -229,6 +243,9 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 		if err := r.updateCurrentClassAnnotation(ctx, latestNamespace, currentNamespaceClass.Name); err != nil {
 			return err
 		}
+
+		// Trigger reconciliation for the old class to update its status
+		r.triggerReconcile(ctx, previousClass)
 	} else if currentClass == "" {
 		// No current class recorded, but original class exists - initialize current class
 		if err := r.updateCurrentClassAnnotation(ctx, latestNamespace, currentNamespaceClass.Name); err != nil {
@@ -246,14 +263,49 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 		return err
 	}
 
+	// Update status to track lastAppliedClass for class switching
+	if previousClass != "" && previousClass != currentNamespaceClass.Name {
+		if err := r.updateClassSwitchStatus(ctx, latestNamespace, currentNamespaceClass.Name, previousClass); err != nil {
+			contextLogger.Error(err, "Failed to update class switch status",
+				"namespace", latestNamespace.Name,
+				"currentClass", currentNamespaceClass.Name,
+				"previousClass", previousClass)
+		}
+	}
+
 	return nil
+}
+
+// triggerReconcile queues a reconciliation for the specified NamespaceClass
+func (r *NamespaceClassReconciler) triggerReconcile(ctx context.Context, className string) {
+	logger := logf.FromContext(ctx)
+
+	if className == "" {
+		return
+	}
+
+	// Create a request to reconcile the class
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name: className,
+		},
+	}
+
+	logger.Info("Triggering reconciliation for class", "class", className)
+
+	go func() {
+		// Use a small delay to let current reconciliation finish
+		time.Sleep(100 * time.Millisecond)
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			logger.Error(err, "Failed to trigger reconciliation for class", "class", className)
+		}
+	}()
 }
 
 // getNamespace returns the Namespace object for the given namespace name.
 func (r *NamespaceClassReconciler) getNamespace(ctx context.Context, namespaceName string) (*corev1.Namespace, error) {
 	namespace := &corev1.Namespace{}
 	if err := r.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
-		// Don't ignore NotFound errors - they should be handled by the caller
 		return nil, err
 	}
 	return namespace, nil
@@ -424,8 +476,8 @@ func (r *NamespaceClassReconciler) setClassAnnotations(ctx context.Context, name
 	return nil
 }
 
-// updateCurrentClassAnnotation updates only the current class annotation on a namespace.
-// This is used when switching from one class to another, while preserving the original class.
+// updateCurrentClassAnnotation updates the current class annotation on a namespace.
+// This is used when switching from one class to another, while also updating the last applied class.
 func (r *NamespaceClassReconciler) updateCurrentClassAnnotation(ctx context.Context, namespace *corev1.Namespace, currentClass string) error {
 	logger := logf.FromContext(ctx)
 
@@ -435,7 +487,7 @@ func (r *NamespaceClassReconciler) updateCurrentClassAnnotation(ctx context.Cont
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	logger.Info("Updating current class annotation",
+	logger.Info("Updating class annotations",
 		"namespace", namespace.Name,
 		"newCurrentClass", currentClass)
 
@@ -445,7 +497,7 @@ func (r *NamespaceClassReconciler) updateCurrentClassAnnotation(ctx context.Cont
 		return fmt.Errorf("failed to get latest namespace state: %w", err)
 	}
 
-	// Get existing current class for logging
+	// Get existing current class before it changes - this will be the new last-applied-class
 	existingCurrentClass := ""
 	if latestNamespace.Annotations != nil {
 		existingCurrentClass = latestNamespace.Annotations[CurrentClassAnnotation]
@@ -456,19 +508,30 @@ func (r *NamespaceClassReconciler) updateCurrentClassAnnotation(ctx context.Cont
 		latestNamespace.Annotations = make(map[string]string)
 	}
 
-	// Update only the current class annotation
+	// Only update last-applied-class if:
+	// 1. There's an existing current class (not first-time setup)
+	// 2. It's different from the new class (actual switch)
+	if existingCurrentClass != "" && existingCurrentClass != currentClass {
+		// Update last-applied-class annotation to the previous current class
+		latestNamespace.Annotations[LastAppliedClassAnnotation] = existingCurrentClass
+		logger.Info("Updating last-applied-class annotation",
+			"namespace", latestNamespace.Name,
+			"newLastAppliedClass", existingCurrentClass)
+	}
+
+	// Update the current class annotation
 	latestNamespace.Annotations[CurrentClassAnnotation] = currentClass
 
 	// Update the namespace in the cluster
 	if err := r.Update(ctx, latestNamespace); err != nil {
-		logger.Error(err, "Failed to update current class annotation",
+		logger.Error(err, "Failed to update class annotations",
 			"namespace", latestNamespace.Name,
 			"previousCurrentClass", existingCurrentClass,
 			"newCurrentClass", currentClass)
 		return err
 	}
 
-	logger.Info("Successfully updated current class annotation",
+	logger.Info("Successfully updated class annotations",
 		"namespace", latestNamespace.Name,
 		"previousCurrentClass", existingCurrentClass,
 		"newCurrentClass", currentClass)
@@ -554,21 +617,34 @@ func (r *NamespaceClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueNamespaceWithClassFilter),
 			builder.WithPredicates(predicate.Funcs{
-				// Only process namespaces that have the namespaceclass.akuity.io/name label and are not being deleted
+				// Process namespaces that have the namespaceclass.akuity.io/name label or relevant annotations
 				CreateFunc: func(e event.CreateEvent) bool {
-					return e.Object.GetLabels()[NamespaceClassLabel] != "" && e.Object.GetDeletionTimestamp() == nil
+					return (e.Object.GetLabels()[NamespaceClassLabel] != "" ||
+						e.Object.GetAnnotations()[CurrentClassAnnotation] != "") &&
+						e.Object.GetDeletionTimestamp() == nil
 				},
 				UpdateFunc: func(e event.UpdateEvent) bool {
-					// Process updates only if the label exists in either old or new version
 					// Skip if the new object is being deleted
 					if e.ObjectNew.GetDeletionTimestamp() != nil {
 						return false
 					}
-					return e.ObjectNew.GetLabels()[NamespaceClassLabel] != "" ||
-						e.ObjectOld.GetLabels()[NamespaceClassLabel] != ""
+
+					// Watch for label changes
+					newLabel := e.ObjectNew.GetLabels()[NamespaceClassLabel]
+					oldLabel := e.ObjectOld.GetLabels()[NamespaceClassLabel]
+
+					// Watch for annotation changes
+					newAnnotation := e.ObjectNew.GetAnnotations()[CurrentClassAnnotation]
+					oldAnnotation := e.ObjectOld.GetAnnotations()[CurrentClassAnnotation]
+
+					// Either value is non-empty AND there was a change
+					hasLabelChange := (newLabel != oldLabel) || (newLabel != "" || oldLabel != "")
+					hasAnnotationChange := (newAnnotation != oldAnnotation) || (newAnnotation != "" || oldAnnotation != "")
+					return hasLabelChange || hasAnnotationChange
 				},
 				DeleteFunc: func(e event.DeleteEvent) bool {
-					return e.Object.GetLabels()[NamespaceClassLabel] != ""
+					return e.Object.GetLabels()[NamespaceClassLabel] != "" ||
+						e.Object.GetAnnotations()[CurrentClassAnnotation] != ""
 				},
 			}),
 		).
@@ -603,7 +679,8 @@ func (r *NamespaceClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// enqueueNamespaceWithClassFilter is a predicate that only triggers reconciliation for namespaces with a namespaceClass label
+// enqueueNamespaceWithClassFilter is a predicate that triggers reconciliation for namespaces with a namespaceClass label
+// and for any previously associated NamespaceClass when the label changes
 func (r *NamespaceClassReconciler) enqueueNamespaceWithClassFilter(ctx context.Context, o client.Object) []reconcile.Request {
 	logger := logf.FromContext(ctx)
 	namespace, ok := o.(*corev1.Namespace)
@@ -620,25 +697,66 @@ func (r *NamespaceClassReconciler) enqueueNamespaceWithClassFilter(ctx context.C
 		return nil
 	}
 
-	// Get the namespace class name from the label
-	className := ""
+	var requests []reconcile.Request
+
+	// Get the current namespace class name from the label
+	currentClassName := ""
 	if namespace.Labels != nil {
-		className = namespace.Labels[NamespaceClassLabel]
+		currentClassName = namespace.Labels[NamespaceClassLabel]
 	}
 
-	if className == "" {
-		logger.V(1).Info("Namespace doesn't have a NamespaceClass label, skipping",
-			"namespace", namespace.Name)
-		return nil
+	// Check for the current annotation to detect class switches
+	previousClassName := ""
+	if namespace.Annotations != nil {
+		previousClassName = namespace.Annotations[CurrentClassAnnotation]
 	}
 
-	return []reconcile.Request{
-		{
+	// We need to trigger reconciliation in these cases:
+	// 1. For the namespace itself - always
+	// 2. For the new class - if it exists
+	// 3. For the old class - if it's different from the new class (class switch)
+
+	// Always add the namespace itself to be reconciled
+	if currentClassName != "" || previousClassName != "" {
+		logger.Info("Adding namespace for reconciliation",
+			"namespace", namespace.Name,
+			"currentClass", currentClassName,
+			"previousClass", previousClassName)
+
+		requests = append(requests, reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Name: namespace.Name,
 			},
-		},
+		})
 	}
+
+	// If we're switching classes, also trigger reconciliation for both the old and new classes
+	if previousClassName != "" && currentClassName != previousClassName && previousClassName != currentClassName {
+		logger.Info("Detected class switch, reconciling both classes",
+			"namespace", namespace.Name,
+			"previousClass", previousClassName,
+			"currentClass", currentClassName)
+
+		// Add the previous class for reconciliation
+		if previousClassName != "" {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name: previousClassName,
+				},
+			})
+		}
+	}
+
+	// Also add the current class (if different from previous)
+	if currentClassName != "" && currentClassName != previousClassName {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name: currentClassName,
+			},
+		})
+	}
+
+	return requests
 }
 
 // cleanupAllNamespaceClassResources removes all resources labeled with a specific NamespaceClass.
@@ -650,10 +768,7 @@ func (r *NamespaceClassReconciler) cleanupAllNamespaceClassResources(ctx context
 		"class", className)
 
 	// List all resources with the owner label for this class
-	resources, err := r.listResourcesWithLabel(ctx, namespace.Name, NamespaceClassOwner, className)
-	if err != nil {
-		return fmt.Errorf("failed to list resources with owner label: %w", err)
-	}
+	resources := r.listResourcesWithLabel(ctx, namespace.Name, NamespaceClassOwner, className)
 
 	logger.Info("Found resources to delete",
 		"namespace", namespace.Name,
@@ -662,7 +777,6 @@ func (r *NamespaceClassReconciler) cleanupAllNamespaceClassResources(ctx context
 
 	// Delete each found resource
 	for _, resource := range resources {
-		// Get resource info for logging
 		gvk := resource.GetObjectKind().GroupVersionKind()
 		name := resource.GetName()
 
@@ -675,7 +789,6 @@ func (r *NamespaceClassReconciler) cleanupAllNamespaceClassResources(ctx context
 		// Delete the resource
 		if err := r.Client.Delete(ctx, resource); err != nil {
 			if apierrors.IsNotFound(err) {
-				// Already gone, that's fine
 				continue
 			}
 			logger.Error(err, "Failed to delete resource",
@@ -683,7 +796,6 @@ func (r *NamespaceClassReconciler) cleanupAllNamespaceClassResources(ctx context
 				"class", className,
 				"kind", gvk.Kind,
 				"name", name)
-			// Continue with other resources even if one fails
 		}
 	}
 

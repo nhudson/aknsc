@@ -211,9 +211,7 @@ func (r *NamespaceClassReconciler) applyResourceToNamespace(
 		"name", resourceName,
 		"apiVersion", apiVersion)
 
-	if err := r.prepareResourceForNamespace(unstructuredObj, namespace, namespaceClass); err != nil {
-		return fmt.Errorf("failed to prepare resource %s/%s: %w", resourceKind, resourceName, err)
-	}
+	r.prepareResourceForNamespace(unstructuredObj, namespace, namespaceClass)
 
 	if err := r.applyUnstructuredResource(ctx, unstructuredObj); err != nil {
 		return fmt.Errorf("failed to apply resource %s/%s to namespace %s: %w",
@@ -233,7 +231,7 @@ func (r *NamespaceClassReconciler) prepareResourceForNamespace(
 	obj *unstructured.Unstructured,
 	namespace *corev1.Namespace,
 	namespaceClass *v1alpha1.NamespaceClass,
-) error {
+) {
 	// Set the namespace for the resource
 	obj.SetNamespace(namespace.Name)
 
@@ -244,8 +242,6 @@ func (r *NamespaceClassReconciler) prepareResourceForNamespace(
 	}
 	labels[NamespaceClassOwner] = namespaceClass.Name
 	obj.SetLabels(labels)
-
-	return nil
 }
 
 // applyUnstructuredResource creates or updates an unstructured resource.

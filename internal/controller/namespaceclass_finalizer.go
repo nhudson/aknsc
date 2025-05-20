@@ -3,11 +3,11 @@ package controller
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/go-logr/logr"
 	v1alpha1 "github.com/nhudson/aknsc/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,14 +65,7 @@ func (r *NamespaceClassReconciler) handleFinalizerCleanup(ctx context.Context, n
 			}
 
 			// Find all resources with this NamespaceClass owner label
-			resources, err := r.listResourcesWithLabel(ctx, ns.Name, NamespaceClassOwner, nc.Name)
-			if err != nil {
-				contextLogger.Error(err, "Failed to list resources for cleanup",
-					"namespace", ns.Name,
-					"class", nc.Name)
-				errs = append(errs, err)
-				continue
-			}
+			resources := r.listResourcesWithLabel(ctx, ns.Name, NamespaceClassOwner, nc.Name)
 
 			// Delete each resource
 			for _, resource := range resources {
@@ -150,74 +143,67 @@ func (r *NamespaceClassReconciler) handleFinalizerCleanup(ctx context.Context, n
 	return ctrl.Result{}, nil
 }
 
-// listResourcesWithLabel lists all resources in a namespace that have a specific label key/value pair
-func (r *NamespaceClassReconciler) listResourcesWithLabel(ctx context.Context, namespace string, labelKey string, labelValue string) ([]client.Object, error) {
+// listResourcesWithLabel finds all resources in a namespace that have a specific label key/value pair
+// It uses discovery to find all available resource types and lists them with the label selector
+func (r *NamespaceClassReconciler) listResourcesWithLabel(ctx context.Context, namespace string, labelKey string, labelValue string) []client.Object {
 	logger := logf.FromContext(ctx)
-
-	// Create a label selector for the owner label
-	labelSelector := client.MatchingLabels{
-		labelKey: labelValue,
-	}
-
-	var allResources []client.Object
+	logger.V(1).Info("Listing resources with label",
+		"namespace", namespace,
+		"labelKey", labelKey,
+		"labelValue", labelValue)
 
 	// Get all API resources in the cluster that we can query
 	resourceLists, err := r.getServerPreferredResources()
 	if err != nil {
-		logger.Error(err, "Failed to get server resources")
-		// Continue with an empty list if we can't get resources
+		logger.Error(err, "Failed to get server resources, continuing with empty result")
+		return nil
 	}
 
-	// Process each resource list
+	// Create a label selector for querying resources
+	labelSelector := client.MatchingLabels{
+		labelKey: labelValue,
+	}
+
+	// Estimate initial capacity for results
+	const initialCapacity = 30
+	allResources := make([]client.Object, 0, initialCapacity)
+	resourceSummary := make(map[string]int)
+
+	// Process each resource group/version
 	for _, resourceList := range resourceLists {
-		// Skip empty API groups
 		if len(resourceList.APIResources) == 0 {
 			continue
 		}
 
+		// Parse the group/version
 		groupVersion, err := schema.ParseGroupVersion(resourceList.GroupVersion)
 		if err != nil {
-			logger.Error(err, "Failed to parse group version", "groupVersion", resourceList.GroupVersion)
+			logger.Error(err, "Failed to parse group version, skipping",
+				"groupVersion", resourceList.GroupVersion)
 			continue
 		}
 
-		// Process each resource in this group/version
+		// Process resources in this group/version
 		for _, resource := range resourceList.APIResources {
 			// Skip resources that don't meet our criteria
-			if !resource.Namespaced || !containsString(resource.Verbs, "list") {
+			if !shouldWatchResource(resource) {
 				continue
 			}
 
-			// Skip subresources (like pod/log, pod/exec)
-			if strings.Contains(resource.Name, "/") {
-				continue
+			// List the resources
+			resources := r.listResourcesOfType(ctx, namespace, labelSelector, groupVersion, resource, logger)
+
+			// Track resource types in summary
+			if len(resources) > 0 {
+				kind := resources[0].GetObjectKind().GroupVersionKind().Kind
+				if kind == "" {
+					kind = resource.Kind
+				}
+				resourceSummary[kind] += len(resources)
 			}
 
-			// Create an unstructured list for this resource type
-			listObj := &unstructured.UnstructuredList{}
-			listObj.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   groupVersion.Group,
-				Version: groupVersion.Version,
-				Kind:    resource.Kind + "List", // ListKind
-			})
-
-			// List resources of this type with our label
-			err := r.Client.List(ctx, listObj, client.InNamespace(namespace), labelSelector)
-			if err != nil {
-				// Skip resources that we can't list (likely due to permissions)
-				logger.V(1).Info("Failed to list resources of type, skipping",
-					"kind", resource.Kind,
-					"group", groupVersion.Group,
-					"version", groupVersion.Version,
-					"error", err.Error())
-				continue
-			}
-
-			// Add found resources to our result
-			for i := range listObj.Items {
-				item := listObj.Items[i]
-				allResources = append(allResources, &item)
-			}
+			// Append to results
+			allResources = append(allResources, resources...)
 		}
 	}
 
@@ -227,19 +213,52 @@ func (r *NamespaceClassReconciler) listResourcesWithLabel(ctx context.Context, n
 		"labelValue", labelValue,
 		"count", len(allResources))
 
-	// Log a summary of what we found
-	resourceSummary := map[string]int{}
-	for _, obj := range allResources {
-		kind := obj.GetObjectKind().GroupVersionKind().Kind
-		if kind == "" {
-			kind = "Unknown"
-		}
-		resourceSummary[kind]++
-	}
-
 	for kind, count := range resourceSummary {
 		logger.Info("Resource summary", "kind", kind, "count", count)
 	}
 
-	return allResources, nil
+	return allResources
+}
+
+// listResourcesOfType lists resources of a specific type with the given label selector
+func (r *NamespaceClassReconciler) listResourcesOfType(
+	ctx context.Context,
+	namespace string,
+	labelSelector client.MatchingLabels,
+	groupVersion schema.GroupVersion,
+	resource metav1.APIResource,
+	logger logr.Logger,
+) []client.Object {
+	// Create an unstructured list for this resource type
+	listObj := &unstructured.UnstructuredList{}
+	listObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   groupVersion.Group,
+		Version: groupVersion.Version,
+		Kind:    resource.Kind + "List",
+	})
+
+	// List resources of this type with our label
+	err := r.Client.List(ctx, listObj, client.InNamespace(namespace), labelSelector)
+	if err != nil {
+		// Skip resources that we can't list
+		logger.V(1).Info("Failed to list resources, skipping",
+			"kind", resource.Kind,
+			"group", groupVersion.Group,
+			"version", groupVersion.Version,
+			"error", err.Error())
+		return nil
+	}
+
+	// Quick return if no items found
+	if len(listObj.Items) == 0 {
+		return nil
+	}
+
+	// Convert items to client.Object slice
+	result := make([]client.Object, len(listObj.Items))
+	for i := range listObj.Items {
+		result[i] = &listObj.Items[i]
+	}
+
+	return result
 }

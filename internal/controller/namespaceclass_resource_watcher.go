@@ -260,7 +260,7 @@ func (r *NamespaceClassReconciler) logWatchSummary(logger logr.Logger, result Re
 
 // formatGVKsForLogging formats a list of GVKs for logging, with a maximum number to avoid too verbose logs
 func formatGVKsForLogging(gvks []schema.GroupVersionKind) []string {
-	maxToLog := 10 // Maximum number of types to log
+	maxToLog := 10
 	count := len(gvks)
 	if count > maxToLog {
 		count = maxToLog
