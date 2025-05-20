@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -179,7 +180,7 @@ func shouldWatchResource(apiResource metav1.APIResource) bool {
 	}
 
 	// Only watch resources that support the watch verb
-	if !containsString(apiResource.Verbs, "watch") {
+	if !slices.Contains(apiResource.Verbs, "watch") {
 		return false
 	}
 
@@ -261,10 +262,7 @@ func (r *NamespaceClassReconciler) logWatchSummary(logger logr.Logger, result Re
 // formatGVKsForLogging formats a list of GVKs for logging, with a maximum number to avoid too verbose logs
 func formatGVKsForLogging(gvks []schema.GroupVersionKind) []string {
 	maxToLog := 10
-	count := len(gvks)
-	if count > maxToLog {
-		count = maxToLog
-	}
+	count := min(len(gvks), maxToLog)
 	result := make([]string, 0, count)
 
 	for i, gvk := range gvks {

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,7 +99,7 @@ func (r *NamespaceClassReconciler) findManagedResourcesForGV(
 
 	for _, apiResource := range apiResources {
 		// Skip resources we can't work with
-		if !apiResource.Namespaced || !containsString(apiResource.Verbs, "list") {
+		if !apiResource.Namespaced || !slices.Contains(apiResource.Verbs, "list") {
 			continue
 		}
 
@@ -170,16 +171,6 @@ func (r *NamespaceClassReconciler) listManagedResourcesOfKind(
 	}
 
 	return resources
-}
-
-// containsString checks if a string slice contains a specific string
-func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
 }
 
 // applyResourceToNamespace applies a resource defined in a NamespaceClass to a namespace.

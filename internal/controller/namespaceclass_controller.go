@@ -73,22 +73,22 @@ const (
 )
 
 func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	contextLogger := logf.FromContext(ctx)
-	contextLogger.Info("Starting reconciliation", "object", req.NamespacedName.Name)
+	logger := logf.FromContext(ctx)
+	logger.Info("Starting reconciliation", "object", req.Name)
 
 	// First check if the request is for a NamespaceClass object
 	namespaceClass := &v1alpha1.NamespaceClass{}
 	err := r.Get(ctx, req.NamespacedName, namespaceClass)
 	if err == nil {
 		// This is a NamespaceClass reconciliation request
-		contextLogger.Info("Reconciling NamespaceClass", "name", namespaceClass.Name)
+		logger.Info("Reconciling NamespaceClass", "name", namespaceClass.Name)
 
 		// Find all namespaces with this class
 		namespaceList := &corev1.NamespaceList{}
-		if err := r.List(ctx, namespaceList, client.MatchingLabels{
+		if err = r.List(ctx, namespaceList, client.MatchingLabels{
 			NamespaceClassLabel: namespaceClass.Name,
 		}); err != nil {
-			contextLogger.Error(err, "Failed to list namespaces with class label",
+			logger.Error(err, "Failed to list namespaces with class label",
 				"namespaceClass", namespaceClass.Name)
 			return ctrl.Result{}, err
 		}
@@ -96,59 +96,60 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// Reconcile each namespace that uses this class
 		for i := range namespaceList.Items {
 			namespace := &namespaceList.Items[i]
-			contextLogger.Info("Reconciling namespace using this class",
+			logger.Info("Reconciling namespace using this class",
 				"namespace", namespace.Name,
 				"namespaceClass", namespaceClass.Name)
 
 			// Reconcile this namespace
-			if err := r.reconcileNamespaceWithClass(ctx, namespace, namespaceClass); err != nil {
-				contextLogger.Error(err, "Failed to reconcile namespace with class",
+			if err = r.reconcileNamespaceWithClass(ctx, namespace, namespaceClass); err != nil {
+				logger.Error(err, "Failed to reconcile namespace with class",
 					"namespace", namespace.Name,
 					"namespaceClass", namespaceClass.Name)
 			}
 		}
 
 		// Process finalizer for NamespaceClass
-		if !namespaceClass.ObjectMeta.DeletionTimestamp.IsZero() {
-			result, err := r.reconcileNamespaceClassFinalizer(ctx, namespaceClass, contextLogger)
+		if !namespaceClass.DeletionTimestamp.IsZero() {
+			var result ctrl.Result
+			result, err = r.reconcileNamespaceClassFinalizer(ctx, namespaceClass, logger)
 			if result.Requeue || err != nil {
 				return result, err
 			}
 		}
 
 		// Update status to track namespaces using this class
-		if err := r.updateNamespaceClassStatus(ctx, namespaceClass); err != nil {
-			contextLogger.Error(err, "Failed to update NamespaceClass status")
+		if err = r.updateNamespaceClassStatus(ctx, namespaceClass); err != nil {
+			logger.Error(err, "Failed to update NamespaceClass status")
 			return ctrl.Result{}, err
 		}
 
-		contextLogger.Info("Successfully reconciled NamespaceClass")
+		logger.Info("Successfully reconciled NamespaceClass")
 		return ctrl.Result{}, nil
 	} else if !apierrors.IsNotFound(err) {
-		contextLogger.Error(err, "Failed to get NamespaceClass", "name", req.NamespacedName.Name)
+		logger.Error(err, "Failed to get NamespaceClass", "name", req.Name)
 		return ctrl.Result{}, err
 	}
 
 	// If we get here, it's a Namespace reconciliation request
-	namespace, err := r.getNamespace(ctx, req.NamespacedName.Name)
+	namespace, err := r.getNamespace(ctx, req.Name)
 	if err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			contextLogger.Error(err, "unable to fetch Namespace")
+			logger.Error(err, "unable to fetch Namespace")
 			return ctrl.Result{}, err
 		}
 		// Namespace not found, it might have been deleted
-		contextLogger.Info("Namespace not found, ignoring", "namespace", req.NamespacedName.Name)
+		logger.Info("Namespace not found, ignoring", "namespace", req.Name)
 		return ctrl.Result{}, nil
 	}
 
 	// Check if namespace is being deleted, if so, don't try to reconcile resources
 	if namespace.DeletionTimestamp != nil {
-		contextLogger.Info("Namespace is being deleted, skipping reconciliation", "namespace", namespace.Name)
+		logger.Info("Namespace is being deleted, skipping reconciliation", "namespace", namespace.Name)
 		return ctrl.Result{}, nil
 	}
 
 	// Log the current state of the namespace
-	contextLogger.Info("Current namespace state",
+	logger.Info("Current namespace state",
 		"namespace", namespace.Name,
 		"labels", namespace.Labels,
 		"annotations", namespace.Annotations)
@@ -156,13 +157,13 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Get the current NamespaceClass for this Namespace based on the label
 	currentNamespaceClass, err := r.getNamespaceClass(ctx, namespace)
 	if err != nil {
-		contextLogger.Error(err, "failed to get NamespaceClass", "namespace", namespace.Name)
+		logger.Error(err, "failed to get NamespaceClass", "namespace", namespace.Name)
 		return ctrl.Result{}, err
 	}
 
 	// If currentNamespaceClass is nil, no reconciliation needed
 	if currentNamespaceClass == nil {
-		contextLogger.Info("No NamespaceClass found for namespace, skipping", "namespace", namespace.Name)
+		logger.Info("No NamespaceClass found for namespace, skipping", "namespace", namespace.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -171,7 +172,7 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	contextLogger.Info("Successfully reconciled namespace with NamespaceClass",
+	logger.Info("Successfully reconciled namespace with NamespaceClass",
 		"namespace", namespace.Name,
 		"namespaceClass", currentNamespaceClass.Name)
 	return ctrl.Result{}, nil
@@ -179,11 +180,11 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 // reconcileNamespaceWithClass handles the reconciliation of a namespace with its NamespaceClass
 func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Context, namespace *corev1.Namespace, currentNamespaceClass *v1alpha1.NamespaceClass) error {
-	contextLogger := logf.FromContext(ctx)
+	logger := logf.FromContext(ctx)
 
 	// Get the most up-to-date namespace state
 	latestNamespace := &corev1.Namespace{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
 		return fmt.Errorf("failed to get latest namespace state: %w", err)
 	}
 
@@ -194,7 +195,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 		currentClass = latestNamespace.Annotations[CurrentClassAnnotation]
 	}
 
-	contextLogger.Info("Namespace class state",
+	logger.Info("Namespace class state",
 		"namespace", latestNamespace.Name,
 		"targetClass", currentNamespaceClass.Name,
 		"originalClass", originalClass,
@@ -204,7 +205,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 	// Only set the original class annotation if it doesn't exist yet (first time setup)
 	if originalClass == "" {
 		// No original class recorded, this is the first application
-		contextLogger.Info("Setting original class annotation for first-time setup",
+		logger.Info("Setting original class annotation for first-time setup",
 			"namespace", latestNamespace.Name,
 			"class", currentNamespaceClass.Name)
 
@@ -222,7 +223,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 
 	// Detect class switch by comparing current class with target class
 	if currentClass != "" && currentClass != currentNamespaceClass.Name {
-		contextLogger.Info("Detected NamespaceClass switch",
+		logger.Info("Detected NamespaceClass switch - CLEANUP NEEDED",
 			"namespace", latestNamespace.Name,
 			"previousClass", currentClass,
 			"targetClass", currentNamespaceClass.Name,
@@ -233,7 +234,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 
 		// Clean up resources from the current class before switching
 		if err := r.cleanupPreviousNamespaceClassResources(ctx, latestNamespace, currentClass, currentNamespaceClass.Name); err != nil {
-			contextLogger.Error(err, "Failed to clean up resources from previous NamespaceClass",
+			logger.Error(err, "Failed to clean up resources from previous NamespaceClass",
 				"namespace", latestNamespace.Name,
 				"currentClass", currentClass)
 			return err
@@ -252,21 +253,21 @@ func (r *NamespaceClassReconciler) reconcileNamespaceWithClass(ctx context.Conte
 			return err
 		}
 	} else {
-		contextLogger.Info("No class switch detected",
+		logger.Info("No class switch detected",
 			"namespace", latestNamespace.Name,
 			"class", currentNamespaceClass.Name)
 	}
 
 	// Reconcile the NamespaceClass resources
 	if err := r.reconcileNamespaceClassResources(ctx, latestNamespace, currentNamespaceClass); err != nil {
-		contextLogger.Error(err, "failed to reconcile NamespaceClass resources", "namespace", latestNamespace.Name)
+		logger.Error(err, "failed to reconcile NamespaceClass resources", "namespace", latestNamespace.Name)
 		return err
 	}
 
 	// Update status to track lastAppliedClass for class switching
 	if previousClass != "" && previousClass != currentNamespaceClass.Name {
 		if err := r.updateClassSwitchStatus(ctx, latestNamespace, currentNamespaceClass.Name, previousClass); err != nil {
-			contextLogger.Error(err, "Failed to update class switch status",
+			logger.Error(err, "Failed to update class switch status",
 				"namespace", latestNamespace.Name,
 				"currentClass", currentNamespaceClass.Name,
 				"previousClass", previousClass)
@@ -353,7 +354,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceClassResources(ctx context.
 	// Get the latest namespace state - this is important to have the most up-to-date
 	// labels and annotations, especially the LastAppliedClassAnnotation
 	latestNamespace := &corev1.Namespace{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.V(1).Info("Namespace no longer exists, skipping resource application",
 				"namespace", namespace.Name)
@@ -399,7 +400,7 @@ func (r *NamespaceClassReconciler) reconcileNamespaceClassResources(ctx context.
 			"totalResources", len(resources))
 
 		// Check again before each resource application
-		if err := r.Client.Get(ctx, types.NamespacedName{Name: latestNamespace.Name}, latestNamespace); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Name: latestNamespace.Name}, latestNamespace); err != nil {
 			if apierrors.IsNotFound(err) {
 				logger.Info("Namespace no longer exists during resource application",
 					"namespace", latestNamespace.Name)
@@ -447,7 +448,7 @@ func (r *NamespaceClassReconciler) setClassAnnotations(ctx context.Context, name
 
 	// Get the latest namespace state to prevent update conflicts
 	latestNamespace := &corev1.Namespace{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
 		return fmt.Errorf("failed to get latest namespace state: %w", err)
 	}
 
@@ -493,7 +494,7 @@ func (r *NamespaceClassReconciler) updateCurrentClassAnnotation(ctx context.Cont
 
 	// Get the latest namespace state to prevent update conflicts
 	latestNamespace := &corev1.Namespace{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: namespace.Name}, latestNamespace); err != nil {
 		return fmt.Errorf("failed to get latest namespace state: %w", err)
 	}
 
@@ -787,7 +788,7 @@ func (r *NamespaceClassReconciler) cleanupAllNamespaceClassResources(ctx context
 			"name", name)
 
 		// Delete the resource
-		if err := r.Client.Delete(ctx, resource); err != nil {
+		if err := r.Delete(ctx, resource); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
